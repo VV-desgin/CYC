@@ -24,3 +24,4 @@ cd 解压后的文件夹路径
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
+streamlit run app.py
