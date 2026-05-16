@@ -146,7 +146,7 @@ with st.sidebar:
 st.title("🏗️ 5G通信基建数智化交付系统（Demo0.1）")
 st.caption("上传设计元数据表 → AI一键生成施工BOM、资源清单、工序指导书、纤芯分配表及风险提示")
 st.markdown("---")
-tab1, tab2, tab3 = st.tabs(["📊 生成", "📋 资料", "⚠️ 风险提示"])
+tab1, tab2, tab3 = st.tabs(["📊 生成", "📋 资料", "🔍 审查结果"])
 
 with tab1:
     st.subheader("📊 原始数据")
@@ -204,8 +204,8 @@ with tab2:
         view_mode = st.radio("查看模式", ["全部站点汇总", "单站点详细"], horizontal=True)
         selected_site = st.selectbox("选择站点", all_sites) if view_mode == "单站点详细" and all_sites else None
 
-        tabs = st.tabs(["📦 施工BOM", "📝 资源清单", "🔧 工序指导书", "🔌 纤芯分配表"])
-        keys = ["bom", "bor", "bop", "fiber"]
+        tabs = st.tabs(["📦 施工BOM", "📝 资源清单", "🔧 工序指导书", "🔌 纤芯分配表", "⚠️ 风险提示"])
+        keys = ["bom", "bor", "bop", "fiber", "risk"]
         for i, t in enumerate(tabs):
             with t:
                 content = st.session_state.ai_data.get(keys[i], "暂无数据")
@@ -217,8 +217,5 @@ with tab2:
                     st.markdown(content)
 
 with tab3:
-    st.subheader("⚠️ 风险提示与注意事项")
-    if not st.session_state.ai_generation_done:
-        st.info("请先在左侧点击启动按钮")
-    else:
-        st.markdown(st.session_state.ai_data.get("risk", "暂无风险提示"))
+    st.subheader("🔍 审查结果")
+    st.info("审查结果模块预留，暂未接入AI生成。")
