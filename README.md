@@ -15,10 +15,12 @@
 
 ## 🚀 快速开始
 
+### 1. 下载代码
+点击本页右上角绿色 **Code** 按钮 → **Download ZIP**，解压到本地。
+
+### 2. 安装依赖
 ```bash
-git clone https://github.com/CYC/5g-base-station-delivery.git
-cd 5g-base-station-delivery
+cd 解压后的文件夹路径
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-streamlit run app.py
