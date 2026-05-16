@@ -16,7 +16,7 @@
 ## 🚀 快速开始
 
 ```bash
-git clone https://github.com/VV-desgin/5g-base-station-delivery.git
+git clone https://github.com/CYC/5g-base-station-delivery.git
 cd 5g-base-station-delivery
 python -m venv .venv
 .venv\Scripts\activate
