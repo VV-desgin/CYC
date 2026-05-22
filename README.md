@@ -1,26 +1,45 @@
-# 🏗️ 5G通信基建数智化交付系统（Demo0.1）
+# 5G通信基建数智化交付系统 (demo0.2)
 
-## ✨ 功能
+基于 Streamlit 的 5G 通信基站工程交付全流程管理系统。
 
-上传基站设计元数据表（CSV/Excel），AI 一键生成：
+## 功能模块
 
-- 📦 **施工BOM清单** — 物料汇总，相同物料自动合并，数量累加
-- 📝 **资源需求清单** — 工具、人员、工时配置
-- 🔧 **工序指导书** — 8道标准工序，含工艺要求与验收标准
-- 🔌 **纤芯分配表** — 端口对应、纤芯颜色标识
-- ⚠️ **风险提示与注意事项** — 施工风险、合规建议（位于资料模块内）
+- **站点信息管理**：16 项站点字段数据录入与管理
+- **合规审查引擎**：RK-001~RK-010 十项合规检查规则
+- **标准 BOM 生成**：12 项标准物料清单自动计算
+- **纤芯分配表**：ODF 纤芯资源自动分配与可视化
+- **交付输出**：Excel 交付包 + Word 交付报告 + Word 工艺指导书，双格式一键导出
+- **AI 助手**：内置简易 AI 模式 + 外部大模型 API 双模式，支持工程问答与辅助分析
 
-支持查看全部站点汇总或单站点详细，一键下载 Excel。
+## 技术栈
 
-## 🚀 快速开始
+- **前端**：Streamlit (Wide Layout)
+- **数据处理**：pandas
+- **Excel 生成**：openpyxl（含样式、边框、条件格式）
+- **Word 生成**：python-docx
+- **AI 接口**：OpenAI SDK（兼容第三方 API）
 
-### 1. 下载代码
-点击本页右上角绿色 **Code** 按钮 → **Download ZIP**，解压到本地。
+## 快速开始
 
-### 2. 安装依赖
 ```bash
-cd 解压后的文件夹路径
-python -m venv .venv
-.venv\Scripts\activate
+# 1. 安装依赖
 pip install -r requirements.txt
-streamlit run app.py
+
+# 2. 启动应用
+streamlit run main.py
+```
+
+内置 AI 模式无需 API Key 即可运行。外部大模型模式需在侧边栏配置 API Key。
+
+## 项目结构
+
+```
+5g-delivery-system/
+├── main.py            # 主程序入口
+├── requirements.txt   # Python 依赖
+└── .gitignore         # Git 忽略规则
+```
+
+## License
+
+MIT
