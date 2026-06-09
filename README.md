@@ -37,8 +37,8 @@ streamlit run main.py
 ## 项目结构
 
 ```
-SZGC/
-├── app_v3.py          # 主入口，Streamlit 应用
+
+├── main.py          # 主入口，Streamlit 应用
 ├── ai_client.py       # AI 客户端封装
 ├── requirements.txt   # Python 依赖
 
