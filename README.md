@@ -27,7 +27,7 @@ RK-001~RK-010 合规审查 · 12 项标准 BOM · 16 项站点字段 · Word/Exc
 pip install -r requirements.txt
 
 # 2. 启动应用
-streamlit run app_v3.py
+streamlit run main.py
 ```
 
 启动后浏览器访问 `http://localhost:8501`。
@@ -41,8 +41,7 @@ SZGC/
 ├── app_v3.py          # 主入口，Streamlit 应用
 ├── ai_client.py       # AI 客户端封装
 ├── requirements.txt   # Python 依赖
-├── task_logs.json     # 任务日志数据
-└── .gitignore
+
 ```
 
 ## 环境要求
