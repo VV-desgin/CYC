@@ -13,11 +13,18 @@ import pandas as pd
 import time
 import re
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
-from openai import OpenAI
 from openpyxl.styles import Border, Side, Alignment, PatternFill, Font
 from openpyxl.utils import get_column_letter
 from docx.oxml.ns import qn
+
+# v7: 统一 AI 客户端抽象层
+from ai_client import (
+    AIClientFactory, AIClient, AIError, AIErrorType,
+    progress_manager, PLATFORM_CONFIGS, MODEL_SPECIFIC_CONFIGS
+)
 
 st.set_page_config(
     page_title="5G通信基建数智化交付系统",
@@ -535,10 +542,95 @@ AI_STEPS = [
     {"key": "fiber", "label": "纤芯分配表",
      "system": "你是5G光缆工程专家。生成纤芯分配表。必须以标准Markdown表格格式输出，列名：站点编号、光缆编号、纤芯序号、纤芯颜色、起始端子、终止端子、业务类型。第一行为列名，第二行为分隔线，之后每行一条数据。每行必须以 | 开头和结尾。"},
     {"key": "risk", "label": "风险提示",
-     "system": "你是5G通信基建审查专家。依据YD/T 5264-2021分析全部站点数据，输出施工风险提示、注意事项、合规建议。"},
+     "system": "你是5G基站施工安全专家。合规审查已在其他步骤完成，你不需要再做规则逐条审核。你的任务是：基于站点数据中的覆盖场景、取电方式、路由长度、设备台数、接地设备数量等信息，推断施工过程中可能遇到的安全风险和操作难点，给出具体建议。输出格式：按站点分组，每个站点输出 3~5 条自然语言风险建议，不输出表格。每条建议包含：风险描述 → 可能后果 → 预防措施。注意：如果站点数量超过 50 个，不要逐条列出所有站点。改为按风险类型分类汇总，每类给出涉及站点数量和典型案例（不超过 3 个）。长距离站点改为区间统计而非逐一列举。"},
 ]
 
+# ==================== AI 并行生成线程 Worker ====================
+
+def _run_ai_step(step_idx, step, site_data_json, site_count,
+                 platform_name, base_url, api_key, model):
+    """线程 Worker：执行单个 AI 生成步骤（供 ThreadPoolExecutor 使用）"""
+    step_start = time.time()
+    key = step["key"]
+    
+    try:
+        ai_client = AIClientFactory.create_client(platform_name, base_url, api_key, model)
+        
+        if key == "bop":
+            msg_part1 = [
+                {"role": "system", "content": step["system"]},
+                {"role": "user", "content": f"站点数据（{site_count}个），请生成工艺指导书的前3章内容（勘测规划、设备安装、线缆敷设）：\n{site_data_json}"}
+            ]
+            part1, err1 = ai_client.generate(msg_part1, max_tokens=2048, temperature=0.3)
+            if err1:
+                return key, f"生成失败: {err1.message} ({err1.solution})", time.time() - step_start, False
+            
+            part1_preview = (part1 or "")[-200:]
+            msg_part2 = [
+                {"role": "system", "content": step["system"]},
+                {"role": "user", "content": f"继续生成工艺指导书的后3章内容（取电与接地要求、质量检查标准、施工注意事项），基于前文：\n{part1_preview}"}
+            ]
+            part2, err2 = ai_client.generate(msg_part2, max_tokens=2048, temperature=0.3)
+            if err2:
+                result = (part1 or "") + f"\n\n[后3章生成失败: {err2.message}]"
+            else:
+                result = (part1 or "") + "\n\n" + (part2 or "")
+            return key, result, time.time() - step_start, True
+        elif key == "risk":
+            msgs = [
+                {"role": "system", "content": step["system"]},
+                {"role": "user", "content": f"站点数据（{site_count}个）：\n{site_data_json}\n\n注意：覆盖场景=山区/城区/郊区会影响施工路径复杂度；取电方式=直流远供且路由长度>150米时需关注电压降；设备总台数>5时需关注安装调度。请根据各站点实际数据给出差异化建议，不要输出合规审查规则编号（如 RK-001）。"}
+            ]
+            result, err = ai_client.generate(msgs, max_tokens=2048, temperature=0.3)
+            if err:
+                if err.type in (AIErrorType.NETWORK_CONNECTION,):
+                    return key, f"生成失败：网络连接失败，请检查网络后重试", time.time() - step_start, False
+                else:
+                    return key, f"生成失败: {err.message}", time.time() - step_start, False
+            if not result:
+                return key, "生成失败，请重新分析", time.time() - step_start, False
+            return key, result, time.time() - step_start, True
+        else:
+            msgs = [
+                {"role": "system", "content": step["system"]},
+                {"role": "user", "content": f"站点数据（{site_count}个）：\n{site_data_json}"}
+            ]
+            result, err = ai_client.generate(msgs, max_tokens=2048, temperature=0.3)
+            if err:
+                if err.type in (AIErrorType.NETWORK_CONNECTION,):
+                    return key, f"生成失败：网络连接失败，请检查网络后重试", time.time() - step_start, False
+                else:
+                    return key, f"生成失败: {err.message}", time.time() - step_start, False
+            if not result:
+                return key, "生成失败，请重新分析", time.time() - step_start, False
+            return key, result, time.time() - step_start, True
+    except Exception as e:
+        return key, f"生成异常: {str(e)}", time.time() - step_start, False
+
+
 # ==================== Session State 初始化 ====================
+
+# v6: 任务历史持久化辅助函数
+TASK_LOGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "task_logs.json")
+
+def save_task_history():
+    """将 st.session_state.task_history 持久化到本地JSON"""
+    try:
+        with open(TASK_LOGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(st.session_state.task_history, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_task_history():
+    """从本地JSON加载任务历史"""
+    try:
+        if os.path.exists(TASK_LOGS_FILE):
+            with open(TASK_LOGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
 def init_session_state():
     defaults = {
         "uploaded_files": [{"name": "样例数据", "df": DEMO_DF, "valid": True, "errors": []}],
@@ -582,10 +674,18 @@ def init_session_state():
         "cr_chunk_start": 0,               # v4: 合规审查分块起始行
         "cr_chunk_results": None,           # v4: 合规审查累积结果
         "cr_chunk_cp": None,               # v4: 合规审查累积连接对
+        "_network_error": False,            # v5: 网络断连标记
+        "_task_recorded": False,           # v5: 防止任务记录重复写入
+        "_is_reanalyze": False,            # v5: 标记当前任务是否为重分析
+        "_was_cancelled": False,           # v7: 标记是否主动取消生成
+        "_connection_failed": False,       # v7: 标记上次连接是否失败
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+    # v6: 刷新后从本地文件恢复任务历史
+    if not st.session_state.task_history:
+        st.session_state.task_history = load_task_history()
 
 init_session_state()
 
@@ -693,6 +793,45 @@ def load_uploaded_files():
 load_uploaded_files()
 
 # ==================== v3 新增：文件上传验证 ====================
+def preprocess_numeric_columns(df):
+    """数据上传后自动预处理所有数值列，提前过滤无效内容。
+
+    双重保险策略：
+    1. pd.to_numeric(errors='coerce').fillna(0) — 从源头将所有非数字内容
+       （中文占位符、空单元格、文本等）统一转为 NaN 再填充为 0。
+    2. safe_int / safe_float_route 应用层兜底 — 处理 pd.to_numeric 未覆盖的
+       边缘场景（如空格包裹的数字、"123.0" 浮点字符串等）。
+    """
+    # 步骤一：已知数值列 pd.to_numeric 批量清洗（COERCE → NaN → 0）
+    numeric_int_cols = ["接地设备数量", "光口配线对数", "室外接头数量"]
+    numeric_float_cols = ["路由长度(m)"]
+
+    for col in numeric_int_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).apply(safe_int)
+
+    for col in numeric_float_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0).apply(safe_float_route)
+
+    # 步骤二：自动探测其他疑似数值列（包含"数量"、"数"、"长度"、"端口"等关键词的列）
+    numeric_keywords = ["数量", "长度", "端口", "对数", "台数", "站点数", "机柜", "电源"]
+    for col in df.columns:
+        if col in numeric_int_cols or col in numeric_float_cols:
+            continue  # 已处理
+        if any(kw in col for kw in numeric_keywords):
+            try:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).apply(safe_int)
+            except Exception:
+                pass  # 如果列内容复杂导致转换失败，跳过
+
+    # 站点编号统一清洗：去除首尾空格，NaN转空字符串
+    if "站点编号" in df.columns:
+        df["站点编号"] = df["站点编号"].fillna("").astype(str).str.strip()
+
+    return df
+
+
 def validate_uploaded_file(df, filename):
     """验证上传文件的字段完整性和数据有效性"""
     errors = []
@@ -751,10 +890,10 @@ def read_file(f):
 
 
 def get_client(url, key, platform=None):
-    """创建 OpenAI 客户端，含 Key 格式预校验。
+    """创建 AI 客户端（v7 统一抽象层）。
 
-    若 platform 非空，先调用 validate_api_key 做格式/长度/前缀校验，
-    不通过则直接抛出 ValueError，避免无效 Key 进入网络请求。
+    基于 AIClientFactory 创建平台自适应客户端，
+    自动应用平台和模型特定的超时、重试参数。
     """
     if platform and platform != "自定义/本地":
         is_valid, err_msg = validate_api_key(key, platform)
@@ -762,22 +901,11 @@ def get_client(url, key, platform=None):
             raise ValueError(f"API Key 校验失败: {err_msg}")
 
     keys = [k.strip() for k in key.split(",") if k.strip()]
-    return OpenAI(base_url=normalize_base_url(url, platform), api_key=keys[0] if keys else key)
-
-
-def normalize_base_url(url, platform=None):
-    """规范化 API 地址：自定义/本地模式下自动补全 /v1 路径。
-
-    OpenAI SDK 约定 base_url 应指向 /v1 根路径，拼装请求时为 {base_url}/chat/completions。
-    用户可能只输入 http://host:port，需自动补全为标准格式。
-    """
-    import re as _re
-    url = url.strip().rstrip("/")
-    if platform == "自定义/本地":
-        # 已含 /v1 后缀的保持不动
-        if not _re.search(r'/v\d+$', url):
-            url += "/v1"
-    return url
+    api_key = keys[0] if keys else key
+    
+    # v7: 使用统一客户端工厂
+    model = st.session_state.get("ai_model", "")
+    return AIClientFactory.create_client(platform or "", url, api_key, model).client
 
 
 def parse_markdown_table(text):
@@ -906,6 +1034,7 @@ BBU_VENDOR = {
     "BBU3910": "华为", "BBU3900": "华为", "BBU5910": "华为",
     "BBU V9200": "中兴", "BBU V9600": "中兴", "BBU V9800": "中兴",
     "BBU 6648": "爱立信", "BBU 6651": "爱立信",
+    "BBU 6630": "爱立信", "BBU 5216": "爱立信",
 }
 AAU_VENDOR = {
     "AAU5336": "华为", "AAU5339": "华为", "AAU5613": "华为",
@@ -915,10 +1044,49 @@ AAU_VENDOR = {
     "AAU AIR 6488": "爱立信", "AAU AIR 6419": "爱立信",
 }
 
+# 厂家型号前缀规则（用于模糊匹配）
+_VENDOR_PREFIX_RULES = [
+    (("BBU5", "BBU3", "AAU5"), "华为"),
+    (("BBU V", "AAU 7"), "中兴"),
+    (("BBU 6", "BBU 5", "AAU AIR"), "爱立信"),
+    (("BBU R", "AAU R"), "诺基亚"),
+    (("BBU F", "AAU F"), "烽火"),
+]
+
+
+def _match_vendor_by_prefix(model):
+    """通过设备型号前缀规则匹配厂家。精确映射未命中时使用。"""
+    if not model:
+        return ""
+    m = model.strip().upper()
+    # 先尝试精确映射（调用方已做，此处用于兜底）
+    for prefixes, vendor in _VENDOR_PREFIX_RULES:
+        for pfx in prefixes:
+            if m.startswith(pfx.upper()):
+                return vendor
+    return ""
+
+
 def get_device_vendor(bbu, aau):
-    """根据设备型号查厂家，返回 (BBU厂家, AAU厂家)，未知则返回空"""
-    bvu = BBU_VENDOR.get(bbu.strip() if bbu else "", "")
-    avu = AAU_VENDOR.get(aau.strip() if aau else "", "")
+    """根据设备型号查厂家，返回 (BBU厂家, AAU厂家)，未知则返回空。
+
+    匹配策略：
+    1. 精确型号映射（BBU_VENDOR / AAU_VENDOR 字典）
+    2. 前缀规则匹配（华为/中兴/爱立信/诺基亚/烽火）
+    3. 均未命中返回空字符串
+    """
+    bbu_s = bbu.strip() if bbu else ""
+    aau_s = aau.strip() if aau else ""
+
+    bvu = BBU_VENDOR.get(bbu_s, "")
+    avu = AAU_VENDOR.get(aau_s, "")
+
+    # 精确映射未命中 → 前缀规则兜底
+    if not bvu:
+        bvu = _match_vendor_by_prefix(bbu_s)
+    if not avu:
+        avu = _match_vendor_by_prefix(aau_s)
+
     return bvu, avu
 
 
@@ -1018,6 +1186,63 @@ def safe_float_route(value):
     return 0.0
 
 
+# 中文占位符集合（统一在此维护，方便扩展）
+_CN_PLACEHOLDERS = {"（空）", "无", "未填写", "未填", "空", "-", "/", "\\", "—", "不适用", "暂无", "无数据", "其他"}
+
+
+def safe_int(value, default=0):
+    """全局安全整数转换函数。统一处理所有数值字段的类型转换。
+
+    按顺序处理：None/NaN/Inf → 浮点转整 → 直接int → 中文占位符 → 中文数字 → 正则提取数字。
+    所有无法转换为整数的内容统一返回 default（默认0），绝不抛出异常。
+    """
+    # 1) None / pandas NaN / Inf — 最早拦截，防止下游 int() 崩溃
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass  # 非 pandas 可识别的对象，继续走后续分支
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return int(value)
+
+    if isinstance(value, int):
+        return value
+
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return default
+
+    # 2) 直接转换（含 "123.0" 浮点数字符串）
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        pass
+
+    # 3) 中文占位符检测
+    if s in _CN_PLACEHOLDERS:
+        return default
+
+    # 4) 中文数字
+    arabic = chinese_to_arabic(s)
+    if arabic is not None:
+        return arabic
+
+    # 5) 提取数字字符
+    cleaned = re.sub(r'[^\d]', '', s)
+    if cleaned:
+        try:
+            return int(cleaned)
+        except ValueError:
+            pass
+
+    return default
+
+
 def run_compliance_review(df, start_row=0, chunk_size=None, prev_results=None, prev_connection_pairs=None):
     """合规审查。支持分块处理：传入chunk_size时仅处理[start_row, start_row+chunk_size)行，
     返回 (done, results, connection_pairs, next_start)，其中done表示是否处理完所有行。"""
@@ -1033,8 +1258,8 @@ def run_compliance_review(df, start_row=0, chunk_size=None, prev_results=None, p
         network = str(row.get("网络制式", ""))
         route_len = safe_float_route(row.get("路由长度(m)", 0))
         cable_type = str(row.get("线缆类型", ""))
-        grounding = int(safe_float_route(row.get("接地设备数量", 0)) or 0)
-        fiber_pairs = int(safe_float_route(row.get("光口配线对数", 0)) or 0)
+        grounding = safe_int(row.get("接地设备数量", 0))
+        fiber_pairs = safe_int(row.get("光口配线对数", 0))
         power_mode = str(row.get("取电方式", ""))
         start = str(row.get("起点", ""))
         end = str(row.get("终点", ""))
@@ -1134,9 +1359,9 @@ def run_compliance_review(df, start_row=0, chunk_size=None, prev_results=None, p
 def generate_bom_data(sites_df):
     total_sites = len(sites_df)
     L = sum(safe_float_route(row.get("路由长度(m)", 0)) for _, row in sites_df.iterrows())
-    J_val = sum(int(safe_float_route(row.get("室外接头数量", 0)) or 0) for _, row in sites_df.iterrows())
-    K = sum(int(safe_float_route(row.get("光口配线对数", 0)) or 0) for _, row in sites_df.iterrows())
-    N_d = sum(int(safe_float_route(row.get("接地设备数量", 0)) or 0) for _, row in sites_df.iterrows())
+    J_val = sum(safe_int(row.get("室外接头数量", 0)) for _, row in sites_df.iterrows())
+    K = sum(safe_int(row.get("光口配线对数", 0)) for _, row in sites_df.iterrows())
+    N_d = sum(safe_int(row.get("接地设备数量", 0)) for _, row in sites_df.iterrows())
 
     bom_items = [
         {"编号": 1, "项目编码": "TX-GC-001", "专业类别": "通信线路工程", "设备/材料名称": "光缆", "规格型号": "GYTA-按芯数", "单位": "米", "数量": round(L * 1.06, 1), "项目特征": "单模铠装", "工程量计算规则": "路由长度x1.06", "工作内容": "敷设接续", "安装位置": "站点路由", "备注": "预留6%"},
@@ -1160,25 +1385,23 @@ def generate_bor_data(sites_df):
 
 
 def generate_fiber_data(sites_df):
+    """生成纤芯分配表。列名与外部AI输出保持完全一致。"""
     fiber_data = []
     color_map = {1: "蓝", 2: "橙", 3: "绿", 4: "棕", 5: "灰", 6: "白", 7: "红", 8: "黑", 9: "黄", 10: "紫", 11: "粉", 12: "青"}
 
     for _, row in sites_df.iterrows():
         sid = row["站点编号"]
-        cores = int(safe_float_route(row.get("光口配线对数", 12)) or 0) // 2
+        cores = safe_int(row.get("光口配线对数", 12)) // 2
         start = str(row.get("起点", "起点") or "起点")
         end = str(row.get("终点", "终点") or "终点")
         for c in range(1, min(max(cores, 4), 12) + 1):
             fiber_data.append({
-                "工程编号": f"SZ-{sid}",
-                "光缆编号": f"FC-{sid}-{c:02d}",
                 "站点编号": sid,
+                "光缆编号": f"FC-{sid}-{c:02d}",
                 "纤芯序号": c,
                 "纤芯颜色": color_map.get(c, '备用'),
                 "起始端子": f"{start}-P{c}",
                 "终止端子": f"{end}-P{c}",
-                "BBU端口": f"BBU-P1-P{c}",
-                "AAU端口": f"AAU-P1-P{c}",
                 "业务类型": '数据' if c <= cores//2 else '备用'
             })
     return pd.DataFrame(fiber_data)
@@ -1309,9 +1532,30 @@ def generate_risk_content(sites_df):
 
     long_route_text = ""
     if long_route_sites:
-        long_route_text = "\n### 长距离站点\n\n"
-        for sid, rlen in long_route_sites:
-            long_route_text += f"- {sid}：{rlen:.0f}米，需专项施工方案\n"
+        long_route_sites_sorted = sorted(long_route_sites, key=lambda x: x[1], reverse=True)
+        top10 = long_route_sites_sorted[:10]
+        remaining = long_route_sites_sorted[10:]
+
+        bins = {"300~400m": [], "400~500m": [], "500~700m": [], "700m+": []}
+        for sid, rlen in remaining:
+            if rlen < 400:
+                bins["300~400m"].append((sid, rlen))
+            elif rlen < 500:
+                bins["400~500m"].append((sid, rlen))
+            elif rlen < 700:
+                bins["500~700m"].append((sid, rlen))
+            else:
+                bins["700m+"].append((sid, rlen))
+
+        long_route_text = f"\n### 长距离站点（共 {len(long_route_sites)} 个，路由长度 > 300m）\n\n**长度分布：**\n"
+        for label, items in bins.items():
+            if items:
+                lens = [x[1] for x in items]
+                long_route_text += f"- {label}：{len(items)} 个（最长 {max(lens):.0f}m，平均 {sum(lens)/len(lens):.0f}m）\n"
+
+        long_route_text += "\n**长度前 10 站点：**\n"
+        for sid, rlen in top10:
+            long_route_text += f"- {sid}：{rlen:.0f}m，需专项施工方案\n"
 
     return f"""**依据YD/T 5264-2021《5G数字蜂窝移动通信网工程施工监理规范》分析**
 
@@ -1391,6 +1635,7 @@ def style_excel_worksheet(ws, df, title=None):
         ws.column_dimensions[col_letter].width = adjusted_width
 
     freeze_row = data_start_row + 1
+    ws.auto_filter.ref = f"A{data_start_row}:{get_column_letter(ws.max_column)}{ws.max_row}"
     ws.freeze_panes = f"A{freeze_row}"
 
 
@@ -1535,6 +1780,27 @@ def build_excel_bytes(current_df):
                     style_excel_worksheet(ws, df_parsed, title=sheet_titles.get(key))
                 else:
                     pd.DataFrame({"内容": [content]}).to_excel(w, index=False, sheet_name=sheet_name)
+
+        # 长距离站点清单（作为独立工作表）
+        if st.session_state.result_df is not None:
+            df = st.session_state.result_df
+            long_route_data = []
+            for _, row in df.iterrows():
+                route_len = safe_float_route(row.get("路由长度(m)", 0))
+                if route_len > 300:
+                    long_route_data.append({
+                        "站点编号": str(row.get("站点编号", "")),
+                        "站点名称": str(row.get("站点名称", "")),
+                        "路由长度(m)": round(route_len, 1),
+                        "站点类型": str(row.get("站点类型", "")),
+                        "取电方式": str(row.get("取电方式", "")),
+                    })
+            if long_route_data:
+                long_df = pd.DataFrame(long_route_data)
+                long_df = long_df.sort_values("路由长度(m)", ascending=False)
+                long_df.to_excel(w, index=False, sheet_name="长距离站点清单")
+                ws_long = w.sheets["长距离站点清单"]
+                style_excel_worksheet(ws_long, long_df, title="长距离站点清单（路由长度>300m）")
     return output.getvalue()
 
 
@@ -1625,13 +1891,41 @@ def build_word_report_bytes(current_df):
 {st.session_state.ai_data.get('bop', '暂无数据')}
 """
 
-    # 风险提示
+    # 风险提示（正文摘要：超过50行截取前30+后10）
+    risk_full = st.session_state.ai_data.get('risk', '暂无数据')
+    risk_lines = risk_full.split('\n')
+    if len(risk_lines) > 50:
+        risk_body = '\n'.join(risk_lines[:30])
+        risk_tail = '\n'.join(risk_lines[-10:])
+        risk_summary = f"{risk_body}\n\n...（共 {len(risk_lines)} 行，完整内容请查看导出 Excel 的合规审查明细）\n\n{risk_tail}"
+    else:
+        risk_summary = risk_full
+
     report_content += f"""
 
 ## 四、风险提示
 
-{st.session_state.ai_data.get('risk', '暂无数据')}
+{risk_summary}
 """
+
+    # 附录：长距离站点完整清单（已移至Excel交付包，此处仅保留摘要统计）
+    if st.session_state.result_df is not None:
+        df = st.session_state.result_df
+        long_route_full = []
+        for _, row in df.iterrows():
+            route_len = safe_float_route(row.get("路由长度(m)", 0))
+            if route_len > 300:
+                long_route_full.append((str(row.get("站点编号", "")), route_len))
+        if long_route_full:
+            long_route_full.sort(key=lambda x: x[1], reverse=True)
+            # 仅保留统计摘要，完整清单见Excel交付包中的"长距离站点清单"工作表
+            total_long = len(long_route_full)
+            avg_len = sum(x[1] for x in long_route_full) / total_long
+            max_len = long_route_full[0][1]
+            appendix = "\n\n---\n\n## 附录：长距离站点统计\n\n"
+            appendix += f"路由长度超过300m的站点共 **{total_long}** 个，平均长度 **{avg_len:.0f}m**，最长 **{max_len:.0f}m**。\n\n"
+            appendix += "> 完整清单请查看Excel交付包中的「长距离站点清单」工作表。\n"
+            report_content += appendix
 
     doc = create_word_document(report_content, "5G基站工程交付报告")
     word_output = BytesIO()
@@ -2220,6 +2514,8 @@ with st.sidebar:
             if df is None:
                 st.error(f"无法读取文件: {new_name}")
             else:
+                # v5: 上传后立即预处理数值列
+                df = preprocess_numeric_columns(df)
                 # v3: 上传时立即验证
                 is_valid, errors, warnings, missing_new = validate_uploaded_file(df, new_name)
                 if errors:
@@ -2345,6 +2641,7 @@ with st.sidebar:
             st.session_state.review_failures_bytes = None
             st.session_state.ai_step_times = {}
             st.session_state.ai_step_index = 0
+            st.session_state.pop("filter_site", None)
             # 切换数据源后自动触发合规审查
             st.session_state.review_results = run_compliance_review(
                 st.session_state.uploaded_files[st.session_state.current_idx]["df"]
@@ -2441,12 +2738,12 @@ with st.sidebar:
                 st.session_state.word_bop_bytes = None
                 st.session_state.review_failures_bytes = None
                 st.session_state.review_failed = False
+                st.session_state.pop("filter_site", None)
                 # 重分析时重新触发合规审查
                 st.session_state.review_results = run_compliance_review(
                     st.session_state.uploaded_files[st.session_state.current_idx]["df"]
                 )
                 st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -2516,6 +2813,16 @@ with st.sidebar:
             )
             st.session_state.ai_model = model
 
+            # 自定义平台并发上限配置
+            if is_custom:
+                max_conc = st.number_input(
+                    "并发上限",
+                    min_value=1, max_value=10, value=1,
+                    help="根据本地 Ollama/vLLM 的 GPU 数量手动调整并发数",
+                    key="sb_max_concurrency"
+                )
+                st.session_state.ai_custom_max_concurrency = max_conc
+
             # API Key 输入框
             api_key = st.text_input(
                 "API Key",
@@ -2544,49 +2851,18 @@ with st.sidebar:
                         elif not base_url:
                             st.session_state.api_test_result = {"status": "error", "msg": "请填写 API 地址"}
                         else:
-                            # === 第一层：本地格式强校验 ===
                             is_valid, err_msg = validate_api_key(api_key, platform)
                             if not is_valid:
                                 st.session_state.api_test_result = {"status": "error", "msg": f"Key 格式无效: {err_msg}"}
                             else:
-                                # === 第二层：真实网络请求验证（含超时+重试） ===
-                                import time as _time
-                                max_retries = 2
-                                last_error = ""
-                                for attempt in range(max_retries + 1):
-                                    try:
-                                        client = get_client(base_url, api_key, platform=platform)
-                                        # 双层验证：先发一个极短请求确认连通性
-                                        resp = client.chat.completions.create(
-                                            model=model,
-                                            messages=[{"role": "user", "content": "OK"}],
-                                            timeout=15,
-                                            max_tokens=5
-                                        )
-                                        # 验证响应是否包含有效内容（先校验类型再取属性）
-                                        if not hasattr(resp, 'choices'):
-                                            last_error = "响应格式错误：返回非标准对象，请检查 API 地址和模型配置"
-                                        elif not resp.choices or len(resp.choices) == 0:
-                                            last_error = "API 返回异常：无有效 choices"
-                                        elif not hasattr(resp.choices[0], 'message'):
-                                            last_error = "响应格式错误：choices 缺少 message 字段"
-                                        else:
-                                            content = resp.choices[0].message.content
-                                            if content is not None:
-                                                st.session_state.api_test_result = {"status": "success"}
-                                                st.session_state.api_connection_verified = True
-                                                break
-                                            else:
-                                                last_error = "API 返回空内容，Key 可能无效或额度不足"
-                                    except AttributeError:
-                                        last_error = "响应格式错误：返回非标准结构，请检查 API 地址和模型配置"
-                                    except Exception as e:
-                                        last_error = str(e)[:200]
-                                        if attempt < max_retries:
-                                            _time.sleep(1.0)
+                                # v7: 使用统一 AI 客户端测试连接（含自动重试+友好提示）
+                                ai_client = AIClientFactory.create_client(platform, base_url, api_key, model)
+                                conn_ok, conn_msg = ai_client.test_connection()
+                                if conn_ok:
+                                    st.session_state.api_test_result = {"status": "success"}
+                                    st.session_state.api_connection_verified = True
                                 else:
-                                    # 所有重试均失败
-                                    st.session_state.api_test_result = {"status": "error", "msg": f"连接失败: {last_error}"}
+                                    st.session_state.api_test_result = {"status": "error", "msg": conn_msg}
                         st.rerun()
             with col_btn2:
                 if st.button("清除", use_container_width=True, key="btn_clear"):
@@ -2890,7 +3166,7 @@ with st.sidebar:
             else:
                 btn_label = "启动分析"
 
-        btn_disabled = (not st.session_state.use_builtin_ai and not st.session_state.api_connection_verified)
+        btn_disabled = False  # 外部API模式下，点击后自动测试连接，不在此处禁用
 
         # v3: 无效文件阻止分析
         if not is_valid:
@@ -2928,9 +3204,33 @@ with st.sidebar:
                     st.session_state.ai_data = {}
                     st.session_state.ai_dataframes = {}
                     st.session_state.ai_step_times = {}
+                    st.session_state._network_error = False
+                    st.session_state._task_recorded = False
+                    st.session_state._was_cancelled = False
+                    st.session_state._connection_failed = False
+                    st.session_state.pop("filter_site", None)
                     time.sleep(0.05)
                     st.rerun()
                 else:
+                    # 外部API模式 → 启动前自动测试连接
+                    api_key = st.session_state.ai_api_key
+                    base_url = st.session_state.ai_base_url
+                    model = st.session_state.ai_model
+                    platform = st.session_state.ai_platform
+                    
+                    # v7: 使用统一 AI 客户端测试连接
+                    ai_client = AIClientFactory.create_client(platform, base_url, api_key, model)
+                    conn_ok, conn_msg = ai_client.test_connection()
+                    
+                    if not conn_ok:
+                        st.error(f"外部AI引擎连接失败: {conn_msg}")
+                        st.session_state._connection_failed = True
+                        st.rerun()
+                    
+                    st.session_state.api_connection_verified = True
+                    # 重置任务记录标记
+                    st.session_state._task_recorded = False
+                    st.session_state.pop("filter_site", None)
                     # 外部API模式（保持原有逻辑）
                     review_df = run_compliance_review(current_df)
                     st.session_state.review_results = review_df
@@ -2964,27 +3264,28 @@ with st.sidebar:
                     st.session_state.ai_start_time = time.time()
                     st.session_state.ai_step_times = {}
                     st.session_state.ai_timeout = False
+                    st.session_state._network_error = False
                     st.session_state.ai_data = {}
                     st.session_state.offline_mode = False
+                    st.session_state._task_recorded = False
+                    st.session_state._was_cancelled = False
+                    st.session_state._connection_failed = False
+                    st.session_state.ai_futures = None
+                    st.session_state.ai_futures_init = None
                     time.sleep(0.15)
                     st.rerun()
 
     # AI运行中状态
     if st.session_state.ai_running:
-        TIMEOUT_SECONDS = 600
         elapsed = time.time() - st.session_state.ai_start_time
-        if elapsed > TIMEOUT_SECONDS:
-            st.session_state.ai_running = False
-            st.session_state.ai_generation_done = True
-            st.session_state.ai_timeout = True
-            if "total" not in st.session_state.ai_step_times:
-                st.session_state.ai_step_times["total"] = elapsed
-            st.rerun()
-
-        si = st.session_state.ai_step_index
+        
+        # 超时兜底：600s 后警告但不停止（并行模式）
+        if elapsed > 600:
+            st.info(f"部分步骤仍在生成中（已耗时 {elapsed:.0f}s），请稍候...")
+        
+        done_count = len(st.session_state.ai_data) if st.session_state.ai_data else 0
         total_steps = len(AI_STEPS)
-        current_label = AI_STEPS[si]["label"] if si < total_steps else "完成"
-        progress_pct = int((si / total_steps) * 100) if total_steps > 0 else 0
+        progress_pct = int((done_count / total_steps) * 100) if total_steps > 0 else 0
         start_js = int(st.session_state.ai_start_time * 1000)
 
         st.components.v1.html(f"""
@@ -3004,13 +3305,13 @@ with st.sidebar:
         </style>
         <div style="background:#fff;border:1px solid #bfdbfe;border-radius:10px;padding:12px 14px;margin:0;box-shadow:0 1px 3px rgba(0,0,0,0.06);font-family:-apple-system,BlinkMacSystemFont,sans-serif;">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                <span style="font-size:0.78rem;font-weight:600;color:#1e40af;">生成中 · {current_label}</span>
+                <span style="font-size:0.78rem;font-weight:600;color:#1e40af;">并行生成中</span>
                 <span id="live-timer-a" style="font-size:0.68rem;color:#6b7280;">0s</span>
             </div>
             <div style="background:#e8edf2;border-radius:8px;height:6px;overflow:hidden;">
                 <div class="progress-fill-a"></div>
             </div>
-            <div style="font-size:0.65rem;color:#9ca3af;margin-top:4px;">{si}/{total_steps} 步骤</div>
+            <div style="font-size:0.65rem;color:#9ca3af;margin-top:4px;">{done_count}/{total_steps} 步骤</div>
         </div>
         <script>
         (function(){{
@@ -3027,6 +3328,14 @@ with st.sidebar:
         if st.button("取消生成", use_container_width=True, key="sb_cancel"):
             st.session_state.ai_running = False
             st.session_state.ai_generation_done = True
+            st.session_state._task_recorded = True   # 取消时不记录任务历史
+            st.session_state._was_cancelled = True   # 标记为主动取消
+            # 清理并行任务的残留状态
+            if "ai_executor" in st.session_state:
+                st.session_state.ai_executor.shutdown(wait=False)
+            st.session_state.pop("ai_executor", None)
+            st.session_state.ai_futures = None
+            st.session_state.ai_futures_init = None
             st.rerun()
 
     # ========== 第四部分：一键下载 ==========
@@ -3034,53 +3343,66 @@ with st.sidebar:
         total = st.session_state.ai_step_times.get("total", 0)
         if st.session_state.get("ai_timeout", False):
             st.error("生成超时（已超过 10 分钟），已自动终止")
-        # v5: 任务历史记录
-        from datetime import datetime as dt_now
-        task_review = st.session_state.review_results
-        if task_review is not None:
-            task_fail = len(task_review[task_review["结果"].str.contains("失败", na=False)])
-            task_warn = len(task_review[task_review["结果"].str.contains("警告", na=False)])
-            task_pass = len(task_review[task_review["结果"].str.contains("通过", na=False)])
-        else:
-            task_fail, task_warn, task_pass = 0, 0, 0
-        
-        # 判断状态
-        is_rf = st.session_state.get("review_failed", False)
-        if is_rf:
-            task_status = "failed"
-        elif task_warn > 0:
-            task_status = "warning"
-        else:
-            task_status = "success"
-        
-        # 受影响站点数
-        task_sites = set()
-        if task_review is not None:
-            for _, r in task_review.iterrows():
-                res = str(r.get("结果", ""))
-                if "失败" in res or "警告" in res:
-                    task_sites.add(str(r.get("站点", "")))
-        
-        task_files = []
-        if st.session_state.excel_bytes: task_files.append("excel_bytes")
-        if st.session_state.word_report_bytes: task_files.append("word_report_bytes")
-        if st.session_state.word_bop_bytes: task_files.append("word_bop_bytes")
-        if st.session_state.review_failures_bytes: task_files.append("review_failures_bytes")
-        
-        st.session_state.task_history.append({
-            "id": f"TASK-{len(st.session_state.task_history)+1:04d}",
-            "status": task_status,
-            "timestamp": dt_now.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "duration": st.session_state.ai_step_times.get("total", 0),
-            "compliance_summary": {"total": len(task_review) if task_review is not None else 0, "fail": task_fail, "warn": task_warn, "pass": task_pass},
-            "files": task_files,
-            "sites_count": len(task_sites),
-            "error_msg": "合规审查未通过" if is_rf else ""
-        })
+        # v5: 任务历史记录（仅任务完成时写入1条，防止重复）
+        if not st.session_state.get("_task_recorded", False):
+            st.session_state._task_recorded = True
+            from datetime import datetime as dt_now
+            task_review = st.session_state.review_results
+            if task_review is not None:
+                task_fail = len(task_review[task_review["结果"].str.contains("失败", na=False)])
+                task_warn = len(task_review[task_review["结果"].str.contains("警告", na=False)])
+                task_pass = len(task_review[task_review["结果"].str.contains("通过", na=False)])
+            else:
+                task_fail, task_warn, task_pass = 0, 0, 0
+            
+            # 判断状态
+            is_rf = st.session_state.get("review_failed", False)
+            if is_rf:
+                task_status = "failed"
+            elif task_warn > 0:
+                task_status = "warning"
+            else:
+                task_status = "success"
+            
+            # 受影响站点数
+            task_sites = set()
+            if task_review is not None:
+                for _, r in task_review.iterrows():
+                    res = str(r.get("结果", ""))
+                    if "失败" in res or "警告" in res:
+                        task_sites.add(str(r.get("站点", "")))
+            
+            task_files = []
+            if st.session_state.excel_bytes: task_files.append("工程数据包（BOM_纤芯表）")
+            if st.session_state.word_report_bytes: task_files.append("综合交付报告")
+            if st.session_state.word_bop_bytes: task_files.append("施工工艺指导书")
+            if st.session_state.review_failures_bytes: task_files.append("问题整改台账")
+            if st.session_state.compliance_full_excel: task_files.append("合规审查完整明细")
+            
+            # 判断操作类型：从 reanalyze 触发则为"重分析"，否则为"执行分析"
+            op_type = "重分析" if st.session_state.get("_is_reanalyze", False) else "执行分析"
+            
+            st.session_state.task_history.append({
+                "id": f"TASK-{len(st.session_state.task_history)+1:04d}",
+                "status": task_status,
+                "timestamp": dt_now.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "duration": st.session_state.ai_step_times.get("total", 0),
+                "compliance_summary": {"total": len(task_review) if task_review is not None else 0, "fail": task_fail, "warn": task_warn, "pass": task_pass},
+                "files": task_files,
+                "sites_count": len(task_sites),
+                "error_msg": "合规审查未通过" if is_rf else "",
+                "operation_type": op_type,
+            })
+            # v6: 持久化任务历史到本地文件
+            save_task_history()
+            
+            # 重置重分析标记
+            if st.session_state.get("_is_reanalyze"):
+                st.session_state._is_reanalyze = False
 
         st.markdown(f"""
         <div class="completion-banner">
-            生成完成 · 总耗时 {total:.1f}s · 交付文件已就绪，请前往「工程概览」页面底部下载
+            {'生成已取消' if st.session_state.get('_was_cancelled', False) else '生成完成'} · 总耗时 {total:.1f}s · 交付文件已就绪，请前往「工程概览」页面底部下载
         </div>
         """, unsafe_allow_html=True)
 
@@ -3265,6 +3587,48 @@ if st.session_state.show_file_detail:
         st.session_state.show_file_detail = False
         st.rerun()
 
+# ===== v5: Session 保活机制 =====
+# 每 4 分钟发送一次心跳，防止 Streamlit session 因长时间不操作而过期
+if not st.session_state.get("_keepalive_rendered", False):
+    st.session_state._keepalive_rendered = True
+st.html("""
+<div style="height:0; overflow:hidden;">
+<script>
+(function(){
+    var INTERVAL_MS = 240000;  // 4分钟
+    var MAX_IDLE_MIN = 25;     // 25分钟无操作开始提示
+    var lastActivity = Date.now();
+    var warned = false;
+    var warningEl = document.createElement('div');
+    warningEl.style.cssText = 'position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:999999;'
+        + 'background:#fef3c7;color:#92400e;border:1px solid #f59e0b;border-radius:8px;padding:8px 20px;'
+        + 'font-size:0.8rem;font-weight:600;font-family:-apple-system,BlinkMacSystemFont,sans-serif;display:none;';
+    warningEl.textContent = '会话即将过期，请点击任意按钮续期';
+    document.body.appendChild(warningEl);
+
+    // 监听用户活动
+    ['click', 'keydown', 'scroll', 'mousemove'].forEach(function(evt){
+        document.addEventListener(evt, function(){ lastActivity = Date.now(); warned = false; warningEl.style.display = 'none'; }, {passive: true});
+    });
+
+    // 定时发送心跳
+    setInterval(function(){
+        var idleMin = (Date.now() - lastActivity) / 60000;
+        if (idleMin > MAX_IDLE_MIN && !warned) {
+            warningEl.style.display = 'block';
+            warned = true;
+        }
+        // 发送心跳事件保持连接
+        var dummy = document.createElement('div');
+        dummy.setAttribute('data-heartbeat', Date.now());
+        document.body.appendChild(dummy);
+        document.body.removeChild(dummy);
+    }, INTERVAL_MS);
+})();
+</script>
+</div>
+""")
+
 # ===== 标签页 =====
 tab1, tab2, tab3, tab4 = st.tabs(["工程概览", "AI生成施工资料", "合规审查", "任务中心/执行日志"])
 
@@ -3371,131 +3735,162 @@ with tab1:
 
     # ===== AI生成进度（外部API模式）=====
     elif st.session_state.ai_running:
-        TIMEOUT_SECONDS = 600
-        elapsed = time.time() - st.session_state.ai_start_time
-        if elapsed > TIMEOUT_SECONDS:
-            st.session_state.ai_running = False
-            st.session_state.ai_generation_done = True
-            st.session_state.ai_timeout = True
-            if "total" not in st.session_state.ai_step_times:
-                st.session_state.ai_step_times["total"] = elapsed
-            st.rerun()
-
-        si = st.session_state.ai_step_index
-        st.subheader("AI 生成进度")
-        
-        start_js = int(st.session_state.ai_start_time * 1000)
         total_steps = len(AI_STEPS)
-        safe_pct = int((si / total_steps) * 100) if total_steps > 0 else 0
-        st.components.v1.html(f"""
-        <style>
-        * {{ margin:0; padding:0; box-sizing:border-box; }}
-        @keyframes pulse-progress-b {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.65; }}
-        }}
-        .wrap {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            padding: 4px 0 0 0;
-        }}
-        .bar-bg {{
-            background: #e8edf2;
-            border-radius: 8px;
-            height: 6px;
-            overflow: hidden;
-        }}
-        .bar-fill {{
-            background: linear-gradient(90deg, #4f46e5, #7c3aed);
-            height: 6px;
-            border-radius: 8px;
-            width: {safe_pct}%;
-            transition: width 0.6s ease;
-            animation: pulse-progress-b 1.8s ease-in-out infinite;
-        }}
-        .info {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-top: 5px;
-            font-size: 0.75rem;
-            color: #6b7280;
-        }}
-        </style>
-        <div class="wrap">
-            <div class="bar-bg"><div class="bar-fill"></div></div>
-            <div class="info">
-                <span>总进度 {si}/{total_steps} 步骤</span>
-                <span id="live-timer-b" style="font-weight:500;">0s</span>
-            </div>
-        </div>
-        <script>
-        (function(){{
-            var start = {start_js};
-            var el = document.getElementById('live-timer-b');
-            function tick(){{ el.textContent = Math.floor((Date.now() - start) / 1000) + 's'; }}
-            setInterval(tick, 1000);
-            tick();
-        }})();
-        </script>
-        """, height=80)
         
-        progress_cols = st.columns(len(AI_STEPS))
-        for idx, (col, s) in enumerate(zip(progress_cols, AI_STEPS)):
-            with col:
-                with st.container(border=True):
-                    if idx < si:
-                        t = st.session_state.ai_step_times.get(s['key'], 0)
-                        st.success(f"{s['label']}")
-                        st.caption(f"{t:.1f}s")
-                    elif idx == si:
-                        st.warning(f"{s['label']}")
-                    else:
-                        st.info(f"{s['label']}")
-
-        if si < len(AI_STEPS):
+        # ===== 阶段一：首次进入，发起所有并行任务 =====
+        if not st.session_state.get("ai_futures_init"):
+            key_cols = ["站点编号", "站点名称", "站点类型", "网络制式", "覆盖场景", "取电方式", "路由长度", "设备总台数", "光口配线对数"]
+            available_cols = [c for c in key_cols if c in st.session_state.result_df.columns]
+            site_data_json = json.dumps(
+                st.session_state.result_df[available_cols].to_dict(orient='records'),
+                ensure_ascii=False
+            )
+            site_count = len(st.session_state.result_df)
+            
+            try:
+                platform_config = PLATFORM_CONFIGS.get(st.session_state.ai_platform)
+                max_concurrency = getattr(platform_config, 'max_concurrency', 1) if platform_config else 1
+                # 自定义平台读取用户配置的并发上限
+                if st.session_state.ai_platform == "自定义/本地" and "ai_custom_max_concurrency" in st.session_state:
+                    max_concurrency = st.session_state.ai_custom_max_concurrency
+            except Exception:
+                max_concurrency = 1
+            max_workers = min(max_concurrency, total_steps)
+            
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            st.session_state.ai_executor = executor
+            
+            futures = []
+            for idx, step in enumerate(AI_STEPS):
+                future = executor.submit(
+                    _run_ai_step, idx, step,
+                    site_data_json, site_count,
+                    st.session_state.ai_platform, st.session_state.ai_base_url,
+                    st.session_state.ai_api_key, st.session_state.ai_model
+                )
+                futures.append((idx, step["key"], future))
+            
+            st.session_state.ai_futures = futures
+            st.session_state.ai_futures_init = True
+            st.session_state.ai_step_progress = {}
+        
+        # ===== 阶段二/三：进度 UI + 收集 + 完成 → fragment 自动刷新 =====
+        @st.fragment(run_every=1)
+        def _render_parallel_progress():
             elapsed = time.time() - st.session_state.ai_start_time
-            if elapsed > 600:
+            done_count = len(st.session_state.ai_data)
+            
+            st.subheader("AI 生成进度（并行模式）")
+            
+            safe_pct = int((done_count / total_steps) * 100) if total_steps > 0 else 0
+            start_js = int(st.session_state.ai_start_time * 1000)
+            st.components.v1.html(f"""
+            <style>
+            * {{ margin:0; padding:0; box-sizing:border-box; }}
+            @keyframes pulse-progress-b {{
+                0%, 100% {{ opacity: 1; }}
+                50% {{ opacity: 0.65; }}
+            }}
+            .wrap {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                padding: 4px 0 0 0;
+            }}
+            .bar-bg {{
+                background: #e8edf2;
+                border-radius: 8px;
+                height: 6px;
+                overflow: hidden;
+            }}
+            .bar-fill {{
+                background: linear-gradient(90deg, #4f46e5, #7c3aed);
+                height: 6px;
+                border-radius: 8px;
+                width: {safe_pct}%;
+                transition: width 0.6s ease;
+                animation: pulse-progress-b 1.8s ease-in-out infinite;
+            }}
+            .info {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: 5px;
+                font-size: 0.75rem;
+                color: #6b7280;
+            }}
+            </style>
+            <div class="wrap">
+                <div class="bar-bg"><div class="bar-fill"></div></div>
+                <div class="info">
+                    <span>已完成 {done_count}/{total_steps} 步骤</span>
+                    <span id="live-timer-b" style="font-weight:500;">0s</span>
+                </div>
+            </div>
+            <script>
+            (function(){{
+                var start = {start_js};
+                var el = document.getElementById('live-timer-b');
+                function tick(){{ el.textContent = Math.floor((Date.now() - start) / 1000) + 's'; }}
+                setInterval(tick, 1000);
+                tick();
+            }})();
+            </script>
+            """, height=80)
+            
+            progress_cols = st.columns(total_steps)
+            for idx, (col, s) in enumerate(zip(progress_cols, AI_STEPS)):
+                key = s["key"]
+                with col:
+                    with st.container(border=True):
+                        if key in st.session_state.ai_data:
+                            t = st.session_state.ai_step_times.get(key, 0)
+                            st.success(f"{s['label']}")
+                            st.caption(f"{t:.1f}s")
+                        else:
+                            st.warning(f"{s['label']}")
+                            st.caption("生成中...")
+            
+            # 收集已完成的 Future 结果
+            new_data_collected = False
+            if st.session_state.ai_futures:
+                for fi in list(st.session_state.ai_futures):
+                    step_idx, step_key, future = fi
+                    if future.done():
+                        new_data_collected = True
+                        try:
+                            key, result, etime, success = future.result()
+                            if key not in st.session_state.ai_data:
+                                st.session_state.ai_data[key] = result
+                                st.session_state.ai_step_times[key] = etime
+                        except Exception as e:
+                            if step_key not in st.session_state.ai_data:
+                                st.session_state.ai_data[step_key] = f"生成异常: {str(e)}"
+                                st.session_state.ai_step_times[step_key] = 0
+                        st.session_state.ai_futures.remove(fi)
+            
+            # ===== 完成检查：所有步骤完成后立即触发整页刷新 =====
+            if len(st.session_state.ai_data) >= total_steps and st.session_state.ai_running:
+                if "total" not in st.session_state.ai_step_times:
+                    st.session_state.ai_step_times["total"] = time.time() - st.session_state.ai_start_time
                 st.session_state.ai_running = False
                 st.session_state.ai_generation_done = True
-                st.session_state.ai_timeout = True
-                if "total" not in st.session_state.ai_step_times:
-                    st.session_state.ai_step_times["total"] = elapsed
+                if "ai_executor" in st.session_state:
+                    st.session_state.ai_executor.shutdown(wait=False)
+                st.session_state.excel_bytes = build_excel_bytes(current_df)
+                st.session_state.word_report_bytes = build_word_report_bytes(current_df)
+                st.session_state.word_bop_bytes = build_word_bop_bytes()
+                st.session_state.review_failures_bytes = build_review_failures_excel_bytes()
+                st.session_state.compliance_full_excel = build_compliance_review_full_excel_bytes(current_df)
                 st.rerun()
-            step = AI_STEPS[si]
-            try:
-                client = get_client(st.session_state.ai_base_url, st.session_state.ai_api_key, platform=st.session_state.ai_platform)
-                t0 = time.time()
-                rv = (step["key"] == "risk")
-                resp = client.chat.completions.create(
-                    model=st.session_state.ai_model,
-                    messages=[
-                        {"role": "system", "content": step["system"]},
-                        {"role": "user", "content": f"站点数据（{len(st.session_state.result_df)}个）：\\n{st.session_state.result_df.to_string()}"}
-                    ],
-                    timeout=90 if rv else 180,
-                    temperature=0.3,
-                    max_tokens=2048 if rv else 4096
-                )
-                st.session_state.ai_data[step["key"]] = resp.choices[0].message.content if hasattr(resp, 'choices') and resp.choices else "响应格式错误：返回非标准对象，请检查 API 地址和模型配置"
-                st.session_state.ai_step_times[step["key"]] = time.time() - t0
-            except Exception as e:
-                st.session_state.ai_data[step["key"]] = f"生成失败: {str(e)[:300]}"
-            st.session_state.ai_step_index = si + 1
-            time.sleep(0.3)
-            st.rerun()
-        else:
-            elapsed = time.time() - st.session_state.ai_start_time
+            
+            # 同步侧边栏进度：有新数据收集完成时触发整页刷新
+            if new_data_collected and st.session_state.ai_running:
+                st.rerun()
+            
+            # 超时兜底：600s 后警告但不停止，自动延长 300s
             if elapsed > 600:
-                st.session_state.ai_timeout = True
-            st.session_state.ai_step_times["total"] = elapsed
-            st.session_state.ai_running = False
-            st.session_state.ai_generation_done = True
-            st.session_state.excel_bytes = build_excel_bytes(current_df)
-            st.session_state.word_report_bytes = build_word_report_bytes(current_df)
-            st.session_state.word_bop_bytes = build_word_bop_bytes()
-            st.session_state.review_failures_bytes = build_review_failures_excel_bytes()
-            st.session_state.compliance_full_excel = build_compliance_review_full_excel_bytes(current_df)
-            st.rerun()
+                st.warning(f"部分步骤仍在生成中（已耗时 {elapsed:.0f}s），请稍候... 系统已自动延长 300s")
+        
+        _render_parallel_progress()
 
     # ===== 分析完成提示 =====
     if st.session_state.ai_generation_done and not st.session_state.ai_running and not st.session_state.ai_builtin_running:
@@ -3504,6 +3899,9 @@ with tab1:
 
         if is_timeout:
             st.error("生成超时（已超过 10 分钟），已自动终止。请减少数据量后重试。")
+
+        if st.session_state.get("_network_error", False):
+            st.error("网络连接失败，请检查网络后重试。已保留部分生成结果。")
 
         if is_review_failed:
             st.warning("合规审查未通过，已拦截物料清单生成。请前往「交付结果」标签页下载审查报告修正数据后重新上传。")
@@ -3548,6 +3946,8 @@ with tab1:
 
         if is_timeout:
             st.error("生成超时（已超过 10 分钟），已自动终止")
+        elif st.session_state.get("_network_error", False):
+            st.error("网络连接失败，请检查网络后重试。已生成的内容可照常下载。")
         elif is_review_failed:
             st.warning("合规审查未通过，已拦截物料清单生成。请下载审查报告修正数据后重新上传。")
         else:
@@ -3705,24 +4105,76 @@ with tab2:
 
         st.markdown("---")
 
-        all_sites = list(st.session_state.result_df["站点编号"]) if st.session_state.result_df is not None else []
+        # ===== 全局站点筛选器 =====
+        site_list = st.session_state.result_df['站点编号'].dropna().unique().tolist() if st.session_state.result_df is not None else []
+        if site_list:
+            filter_options = ["全部站点"] + [str(s) for s in site_list]
+            fc1, fc2 = st.columns([1, 3])
+            with fc1:
+                filter_site = st.selectbox(
+                    "选择站点",
+                    filter_options,
+                    index=0,
+                    key="filter_site",
+                    label_visibility="collapsed"
+                )
+            with fc2:
+                if filter_site == "全部站点":
+                    st.caption(f"当前展示全部 {len(site_list)} 个站点")
+                else:
+                    st.caption(f"当前仅展示站点：{filter_site}")
+
+        # ===== 查看模式（保留兼容，用于纤芯分配表高级筛选） =====
         view_mode = st.radio("查看模式", ["全部站点汇总", "单站点详细"], horizontal=True, key="tab2_view")
         selected_site = None
-        if "单站点" in view_mode and all_sites:
-            selected_site = st.selectbox("选择站点", all_sites, key="tab2_site")
+        if "单站点" in view_mode and site_list:
+            selected_site = st.selectbox("选择站点", [str(s) for s in site_list], key="tab2_site")
 
-        subtabs = st.tabs(["施工BOM", "资源需求清单", "工艺指导书", "纤芯分配表"])
-        sub_keys = ["bom", "bor", "bop", "fiber"]
+        subtabs = st.tabs(["施工BOM", "资源需求清单", "工艺指导书", "纤芯分配表", "风险提示"])
+        sub_keys = ["bom", "bor", "bop", "fiber", "risk"]
+        _tab_labels = {"bom": "施工BOM", "bor": "资源需求清单", "bop": "工艺指导书", "fiber": "纤芯分配表", "risk": "风险提示"}
+
         for i, t in enumerate(subtabs):
             with t:
                 key = sub_keys[i]
-                # BOP（工艺指导书）始终以 Markdown 渲染
-                if key == "bop":
-                    content = st.session_state.ai_data.get("bop", "暂无数据")
+                # BOP（工艺指导书）和 Risk（风险提示）始终以 Markdown 渲染
+                if key in ("bop", "risk"):
+                    content = st.session_state.ai_data.get(key, "暂无数据")
                     if not content or content == "暂无数据":
-                        st.info("暂无工艺指导书数据，请先生成。")
+                        st.info(f"暂无{_tab_labels.get(key, key)}数据，请先生成。")
                     else:
-                        st.markdown(content)
+                        # 全局站点筛选：按站点编号分节拆分文本
+                        if filter_site != "全部站点":
+                            site_id_str = str(filter_site).strip()
+                            patterns = [
+                                rf'(?:###\s*)?{re.escape(site_id_str)}[\s\S]*?(?=(?:###\s*)?(?:[A-Z]{{1,3}}[-_]\w{{2,}}[-_]\d{{2,}}|\n\n##|\Z))',
+                                rf'{re.escape(site_id_str)}[：:][^\n]*',
+                                rf'(?:^|\n)[^\n]*{re.escape(site_id_str)}[^\n]*',
+                            ]
+                            filtered_parts = []
+                            for pat in patterns:
+                                matches = re.findall(pat, content)
+                                filtered_parts.extend(matches)
+                            if filtered_parts:
+                                st.markdown("\n\n".join(filtered_parts), unsafe_allow_html=False)
+                            else:
+                                # 降级：纯子串定位，取匹配位置到下一个站点标记或文末
+                                idx = content.find(site_id_str)
+                                if idx >= 0:
+                                    next_marker = re.search(
+                                        r'(?:###\s*)?(?:[A-Z]{1,3}[-_]\w{2,}[-_]\d{2,}|\n##)',
+                                        content[idx + len(site_id_str):]
+                                    )
+                                    end = idx + len(site_id_str) + next_marker.start() if next_marker else len(content)
+                                    fallback_text = content[idx:end].strip()
+                                    if fallback_text:
+                                        st.markdown(fallback_text, unsafe_allow_html=False)
+                                    else:
+                                        st.info(f"该站点暂无{_tab_labels.get(key, key)}数据")
+                                else:
+                                    st.info(f"该站点暂无{_tab_labels.get(key, key)}数据")
+                        else:
+                            st.markdown(content, unsafe_allow_html=False)
                     continue
 
                 # 优先使用存储的 DataFrame（内置模式），否则从文本解析（外部 API 模式）
@@ -3745,8 +4197,8 @@ with tab2:
                             st.markdown(cleaned)
                         continue
 
-                # 纤芯分配表支持单站点筛选（列名模糊匹配）
-                if key == "fiber" and selected_site and df_display is not None and not df_display.empty:
+                # 全局站点筛选（DataFrame 类：BOM / BOR / Fiber）
+                if filter_site != "全部站点" and df_display is not None and not df_display.empty:
                     site_col = None
                     if "站点编号" in df_display.columns:
                         site_col = "站点编号"
@@ -3758,10 +4210,10 @@ with tab2:
                                 site_col = c
                                 break
                     if site_col:
-                        df_display = df_display[df_display[site_col].astype(str) == str(selected_site)]
-                    else:
-                        st.caption("（纤芯分配表不含站点编号列，无法按站点筛选）")
-
+                        df_display = df_display[df_display[site_col].astype(str) == str(filter_site)]
+                    if df_display.empty:
+                        st.info(f"该站点暂无{key}数据")
+                        continue
                 # 摘要行：条数 + 关键指标
                 if df_display is None or df_display.empty:
                     st.caption(f"（{key} 表格为空或解析失败）")
@@ -3906,7 +4358,7 @@ with tab3:
             }
             return suggestions.get(rule, "请核实数据后修正")
 
-        def _remap_risk(row):
+        def _remap_risk_nested(row):
             result = str(row.get("结果", ""))
             rule = str(row.get("规则", ""))
             if rule in ["RK-001", "RK-004", "RK-005"]:
@@ -3924,7 +4376,7 @@ with tab3:
             return "低风险"
 
         # 添加风险等级列和整改建议列
-        review_df["风险等级"] = review_df.apply(_remap_risk, axis=1)
+        review_df["风险等级"] = review_df.apply(_remap_risk_nested, axis=1)
         review_df["整改建议"] = review_df["规则"].apply(_get_suggestion)
 
         # 排序：不通过 > 警告 > 通过；同结果内 高风险 > 中风险 > 低风险
@@ -4109,7 +4561,7 @@ with tab3:
                 st.markdown("---")
                 if risk_content and risk_content != "暂无数据" and not risk_content.startswith("生成失败"):
                     st.markdown("### 详细风险分析")
-                    st.markdown(risk_content)
+                    st.markdown(risk_content, unsafe_allow_html=False)
                 else:
                     st.info("暂无详细风险分析数据")
             else:
@@ -4183,6 +4635,7 @@ with tab4:
             
             table_data.append({
                 "任务ID": task_id,
+                "操作类型": t.get("operation_type", "执行分析"),
                 "时间": t.get("timestamp", ""),
                 "状态": status_html,
                 "耗时": f"{t.get('duration', 0):.1f}s",
@@ -4195,6 +4648,7 @@ with tab4:
         if table_data:
             display_df = pd.DataFrame([{
                 "任务ID": d["任务ID"],
+                "操作类型": d["操作类型"],
                 "时间": d["时间"],
                 "状态": "成功" if d["_raw"].get("status")=="success" else ("警告" if d["_raw"].get("status")=="warning" else "失败"),
                 "耗时": d["耗时"],
@@ -4242,26 +4696,40 @@ with tab4:
                         st.session_state.ai_dataframes = {}
                         st.session_state.ai_step_times = {}
                         st.session_state.ai_generation_done = False
+                        st.session_state._task_recorded = False
+                        st.session_state._was_cancelled = False
+                        st.session_state._connection_failed = False
+                        st.session_state._is_reanalyze = True
                         time.sleep(0.05)
                         st.rerun()
                 
                 with op_cols[2]:
+                    import io as io2
+                    import zipfile
+                    from datetime import datetime as dt2
                     if st.button("下载该任务文件", use_container_width=True, key="task_download"):
-                        import io as io2
                         zip_buf = io2.BytesIO()
                         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf2:
                             if st.session_state.excel_bytes:
-                                zf2.writestr("5G基站AI交付结果.xlsx", st.session_state.excel_bytes)
+                                zf2.writestr("工程数据包（BOM_纤芯表）.xlsx", st.session_state.excel_bytes)
                             if st.session_state.word_report_bytes:
-                                zf2.writestr("5G基站工程交付报告.docx", st.session_state.word_report_bytes)
+                                zf2.writestr("综合交付报告.docx", st.session_state.word_report_bytes)
                             if st.session_state.word_bop_bytes:
-                                zf2.writestr("5G基站施工工艺指导书.docx", st.session_state.word_bop_bytes)
+                                zf2.writestr("施工工艺指导书.docx", st.session_state.word_bop_bytes)
                             if st.session_state.review_failures_bytes:
-                                zf2.writestr("合规审查不通过项.xlsx", st.session_state.review_failures_bytes)
+                                zf2.writestr("问题整改台账.xlsx", st.session_state.review_failures_bytes)
+                            if st.session_state.compliance_full_excel:
+                                cdata2, _ = st.session_state.compliance_full_excel if isinstance(st.session_state.compliance_full_excel, tuple) else (st.session_state.compliance_full_excel, "")
+                                if cdata2:
+                                    zf2.writestr("合规审查完整明细.xlsx", cdata2)
+                        st.session_state[f"dl_zip_{selected_task_id}"] = zip_buf.getvalue()
+                        st.rerun()
+                    if st.session_state.get(f"dl_zip_{selected_task_id}"):
+                        now_str = dt2.now().strftime("%Y%m%d_%H%M")
                         st.download_button(
                             f"下载 {selected_task_id}.zip",
-                            zip_buf.getvalue(),
-                            f"{selected_task_id}.zip",
+                            st.session_state[f"dl_zip_{selected_task_id}"],
+                            f"{selected_task_id}_{now_str}.zip",
                             "application/zip",
                             use_container_width=True,
                             key=f"dl_{selected_task_id}"
@@ -4287,4 +4755,3 @@ with tab4:
                         st.markdown("**交付文件**: " + "、".join(files_list))
         else:
             st.info("当前筛选条件下无任务记录。")
-
