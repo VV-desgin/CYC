@@ -1,23 +1,24 @@
-# 5G通信基建数智化交付系统 (app_v3)
+# 5G通信基建数智化交付系统
 
-基于 Streamlit 的 5G 通信基站工程交付全流程管理系统。
+RK-001~RK-010 合规审查 · 12 项标准 BOM · 16 项站点字段 · Word/Excel 双格式交付
 
 ## 功能模块
 
-- **工程概览**：站点信息仪表盘，项目状态与进度可视化
-- **AI生成施工资料**：智能生成施工BOM、纤芯分配表、交付报告
-- **合规审查**：RK-001~RK-010 十项合规检查规则，自动问题整改台账
-- **任务中心**：施工任务分配、跟踪与闭环管理
-- **交付输出**：Excel 交付包 + Word 交付报告，双格式一键导出
-- **AI 助手**：内置 AI 模式 + 外部大模型 API 双模式，支持工程问答与辅助分析
+- **合规审查**：基于标准 BOM 的自动化合规校验，输出审查报告
+- **站点管理**：16 项站点字段的增删改查与批量导入
+- **BOM 管理**：12 项标准物料清单的维护与版本控制
+- **文档交付**：支持 Word / Excel 双格式自动生成与导出
+- **AI 引擎**：内置标准 AI 引擎（开箱即用），支持接入外部大模型（OpenAI 兼容 API）
 
 ## 技术栈
 
-- **前端**：Streamlit (Wide Layout)
-- **数据处理**：pandas
-- **Excel 生成**：openpyxl（含样式、边框、条件格式）
-- **Word 生成**：python-docx
-- **AI 接口**：OpenAI SDK（兼容第三方 API）
+| 组件 | 说明 |
+|------|------|
+| 框架 | Streamlit |
+| 数据处理 | pandas, openpyxl |
+| 文档生成 | python-docx |
+| AI 接口 | openai SDK（兼容任意 OpenAI 格式 API） |
+| 数据存储 | JSON（task_logs） |
 
 ## 快速开始
 
@@ -26,21 +27,25 @@
 pip install -r requirements.txt
 
 # 2. 启动应用
-streamlit run main.py
+streamlit run app_v3.py
 ```
 
-内置 AI 模式无需 API Key 即可运行。外部大模型模式需在侧边栏配置 API Key。
+启动后浏览器访问 `http://localhost:8501`。
+
+> 默认使用内置 AI 引擎，无需配置 API Key 即可使用合规审查功能。如需启用全量 AI 生成，在界面中配置 API Key 并测试连接。
 
 ## 项目结构
 
 ```
-5g-delivery-system/
-├── main.py            # 主程序入口 (app_v3)
+SZGC/
+├── app_v3.py          # 主入口，Streamlit 应用
+├── ai_client.py       # AI 客户端封装
 ├── requirements.txt   # Python 依赖
-├── .gitignore         # Git 忽略规则
-└── README.md          # 项目说明
+├── task_logs.json     # 任务日志数据
+└── .gitignore
 ```
 
-## License
+## 环境要求
 
-MIT
+- Python 3.8+
+- Windows / macOS / Linux
